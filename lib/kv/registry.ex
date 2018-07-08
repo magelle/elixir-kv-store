@@ -1,69 +1,72 @@
 defmodule KV.Registry do
     use GenServer
-
+  
     ## Client API
-
+  
     @doc """
-    Starts the registry
+    Starts the registry with the given options.
+  
+    `:name` is always required.
     """
     def start_link(opts) do
-        GenServer.start_link(__MODULE__, :ok, opts) ## __MODULE__ eans current module
+      # 1. Pass the name to GenServer's init
+      server = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, server, opts)
     end
-
+  
     @doc """
-    Stops the registry.
-    """
-    def stop(server) do
-        GenServer.stop(server)
-    end
-
-    @doc """
-    Looks up th bucket pid for `name` stored in `server`.
-
-    Return `{:ok, pid}` if the bucket exists, `:error` otherwise.
+    Looks up the bucket pid for `name` stored in `server`.
+  
+    Returns `{:ok, pid}` if the bucket exists, `:error` otherwise.
     """
     def lookup(server, name) do
-        GenServer.call(server, {:lookup, name})
+      # 2. Lookup is now done directly in ETS, without accessing the server
+      case :ets.lookup(server, name) do
+        [{^name, pid}] -> {:ok, pid}
+        [] -> :error
+      end
     end
-
+  
     @doc """
     Ensures there is a bucket associated with the given `name` in `server`.
     """
     def create(server, name) do
-        GenServer.cast(server, {:create, name})
+      GenServer.call(server, {:create, name})
     end
-
-    ## Server Callbacks
-
-    def init(:ok) do
-        names = %{}
-        refs = %{}
-        {:ok, {names, refs}}
+  
+    ## Server callbacks
+  
+    def init(table) do
+      # 3. We have replaced the names map by the ETS table
+      names = :ets.new(table, [:named_table, read_concurrency: true])
+      refs  = %{}
+      {:ok, {names, refs}}
     end
-
-    def handle_call({:lookup, name}, _from, {names, _} = state) do
-        {:reply, Map.fetch(names, name), state}
-    end
-
-    def handle_cast({:create, name}, {names, refs}) do
-        if Map.has_key?(names, name) do
-          {:noreply, {names, refs}}
-        else
+  
+    # 4. The previous handle_call callback for lookup was removed
+  
+    def handle_call({:create, name}, _from, {names, refs}) do
+      case lookup(names, name) do
+        {:ok, pid} ->
+          {:reply, pid, {names, refs}}
+        :error ->
           {:ok, pid} = DynamicSupervisor.start_child(KV.BucketSupervisor, KV.Bucket)
           ref = Process.monitor(pid)
           refs = Map.put(refs, ref, name)
-          names = Map.put(names, name, pid)
-          {:noreply, {names, refs}}
-        end
+          :ets.insert(names, {name, pid})
+          {:reply, pid, {names, refs}}
+      end
     end
-
+  
     def handle_info({:DOWN, ref, :process, _pid, _reason}, {names, refs}) do
-        {name, refs} = Map.pop(refs, ref)
-        names = Map.delete(names, name)
-        {:noreply, {names, refs}}
+      # 6. Delete from the ETS table instead of the map
+      {name, refs} = Map.pop(refs, ref)
+      :ets.delete(names, name)
+      {:noreply, {names, refs}}
     end
-
+  
     def handle_info(_msg, state) do
-        {:noreply, state}
+      {:noreply, state}
     end
-end
+  end
+  
